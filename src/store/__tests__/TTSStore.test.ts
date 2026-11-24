@@ -1406,7 +1406,7 @@ describe('TTSStore', () => {
       const {played} = await startPlaying(store);
       expect(mockHoldSpeechService).toHaveBeenCalledTimes(1);
       expect(mockHoldSpeechService).toHaveBeenCalledWith({
-        title: 'PocketPal is speaking',
+        title: 'Vasee is speaking',
         stopLabel: 'Stop',
         channelName: 'Speech',
       });
