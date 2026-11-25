@@ -1,0 +1,589 @@
+import * as RNFS from '@dr.pogodin/react-native-fs';
+import {
+  isErrorWithCode,
+  pick,
+  types,
+  errorCodes,
+} from '@react-native-documents/picker';
+import {Platform} from 'react-native';
+import {v4 as uuidv4} from 'uuid';
+import 'react-native-get-random-values';
+
+import {chatSessionRepository} from '../repositories/ChatSessionRepository';
+import {
+  AgentStep,
+  AgentToolCall,
+  AgentToolCallMetrics,
+  AgentToolOutcome,
+  MessageType,
+} from './types';
+import {CompletionParams} from './completionTypes';
+import {migrateCompletionSettings} from './completionSettingsVersions';
+import {palStore} from '../store';
+import {getAbsoluteThumbnailPath, isRemoteThumbnailUrl} from './imageUtils';
+import {isAllowedChatImageUri} from './chatImageUri';
+import type {Pal, ParameterDefinition} from '../types/pal';
+import type {
+  TalentResult,
+  WebSearchResultItem,
+} from '../services/talents/types';
+
+/**
+ * Interface for imported chat session data
+ */
+export interface ImportedChatSession {
+  id: string;
+  title: string;
+  date: string;
+  messages: ImportedMessage[];
+  completionSettings: CompletionParams;
+  activePalId?: string;
+}
+
+/**
+ * Interface for imported message data
+ */
+export interface ImportedMessage {
+  id: string;
+  author: string;
+  text?: string;
+  type: string;
+  metadata?: Record<string, any>;
+  createdAt?: number;
+}
+
+/**
+ * Pick a JSON file using document picker
+ */
+export const pickJsonFile = async (): Promise<string | null> => {
+  try {
+    const res = await pick({
+      type: Platform.OS === 'ios' ? 'public.json' : [types.allFiles],
+    });
+
+    if (res && res.length > 0) {
+      const file = res[0];
+
+      // Check if it's a JSON file
+      if (
+        !file.name?.toLowerCase().endsWith('.json') &&
+        !file.type?.includes('json')
+      ) {
+        throw new Error('Selected file is not a JSON file');
+      }
+
+      return file.uri;
+    }
+    return null;
+  } catch (err: any) {
+    if (isErrorWithCode(err)) {
+      switch (err.code) {
+        case errorCodes.IN_PROGRESS:
+          console.warn(
+            'user attempted to present a picker, but a previous one was already presented',
+          );
+          break;
+        case errorCodes.UNABLE_TO_OPEN_FILE_TYPE:
+          throw new Error('unable to open file type');
+        case errorCodes.OPERATION_CANCELED:
+          // ignore
+          return null;
+        default:
+          console.error(err);
+          throw new Error('unknown error');
+      }
+    }
+    throw err;
+  }
+};
+
+/**
+ * Read and parse a JSON file
+ */
+export const readJsonFile = async (fileUri: string): Promise<any> => {
+  try {
+    const fileContent = await RNFS.readFile(fileUri, 'utf8');
+    return JSON.parse(fileContent);
+  } catch (error) {
+    console.error('Error reading or parsing JSON file:', error);
+    throw new Error('Failed to read or parse the selected file');
+  }
+};
+
+/**
+ * Validate imported chat session data
+ */
+export const validateImportedData = (
+  data: any,
+): ImportedChatSession | ImportedChatSession[] => {
+  // Check if it's an array or a single object
+  if (Array.isArray(data)) {
+    // Validate each session in the array
+    return data.map(session => validateSingleSession(session));
+  } else {
+    // Validate a single session
+    return validateSingleSession(data);
+  }
+};
+
+/**
+ * Validate a single chat session
+ */
+const validateSingleSession = (session: any): ImportedChatSession => {
+  // Check required fields
+  if (!session.title || typeof session.title !== 'string') {
+    throw new Error('Invalid session: missing or invalid title');
+  }
+
+  if (!session.date || typeof session.date !== 'string') {
+    // If date is missing, create a new one
+    session.date = new Date().toISOString();
+  }
+
+  if (!session.messages || !Array.isArray(session.messages)) {
+    session.messages = [];
+  }
+
+  // Validate messages
+  session.messages = session.messages.map((msg: any) => {
+    if (!msg.id) {
+      msg.id = uuidv4();
+    }
+
+    if (!msg.author) {
+      throw new Error('Invalid message: missing author');
+    }
+
+    if (!msg.type) {
+      msg.type = 'text';
+    }
+
+    if (!msg.createdAt) {
+      msg.createdAt = Date.now();
+    }
+
+    if (msg.metadata?.imageUris !== undefined) {
+      msg.metadata.imageUris = Array.isArray(msg.metadata.imageUris)
+        ? msg.metadata.imageUris.filter(isAllowedChatImageUri)
+        : [];
+    }
+
+    return msg;
+  });
+
+  // Ensure completionSettings exists
+  if (!session.completionSettings) {
+    session.completionSettings = {};
+  }
+
+  // Migrate completion settings to latest version
+  session.completionSettings = migrateCompletionSettings(
+    session.completionSettings,
+  );
+
+  // Generate a new ID if not present or to avoid conflicts
+  if (!session.id) {
+    session.id = uuidv4();
+  }
+
+  return session as ImportedChatSession;
+};
+
+/**
+ * Import chat sessions from a JSON file
+ */
+export const importChatSessions = async (): Promise<number> => {
+  try {
+    // Pick a JSON file
+    const fileUri = await pickJsonFile();
+    if (!fileUri) {
+      return 0; // User cancelled
+    }
+
+    // Read and parse the file
+    const data = await readJsonFile(fileUri);
+
+    // Validate the data
+    const validatedData = validateImportedData(data);
+
+    // Import the sessions
+    if (Array.isArray(validatedData)) {
+      // Import multiple sessions
+      let importedCount = 0;
+      for (const session of validatedData) {
+        await importSingleSession(session);
+        importedCount++;
+      }
+      return importedCount;
+    } else {
+      // Import a single session
+      await importSingleSession(validatedData);
+      return 1;
+    }
+  } catch (error) {
+    console.error('Error importing chat sessions:', error);
+    throw error;
+  }
+};
+
+const isPlainObject = (value: unknown): value is Record<string, any> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const isString = (value: unknown): value is string => typeof value === 'string';
+
+const isNumber = (value: unknown): value is number => typeof value === 'number';
+
+const arrayOf =
+  <T>(isItem: (item: unknown) => item is T) =>
+  (value: unknown): value is T[] =>
+    Array.isArray(value) && value.every(isItem);
+
+const isAbsentOr = <T>(
+  value: unknown,
+  isPresent: (item: unknown) => item is T,
+): value is T | null | undefined => value == null || isPresent(value);
+
+const isToolCallMetrics = (value: unknown): value is AgentToolCallMetrics =>
+  isPlainObject(value) && isNumber(value.tokens) && isNumber(value.durationMs);
+
+const isToolCall = (value: unknown): value is AgentToolCall =>
+  isPlainObject(value) &&
+  isString(value.id) &&
+  isPlainObject(value.function) &&
+  isString(value.function.name) &&
+  (isString(value.function.arguments) ||
+    isPlainObject(value.function.arguments)) &&
+  isAbsentOr(value.metrics, isToolCallMetrics);
+
+const isSearchHit = (value: unknown): value is WebSearchResultItem =>
+  isPlainObject(value) &&
+  isString(value.url) &&
+  isString(value.title) &&
+  isString(value.snippet);
+
+const hasResultFields = (result: Record<string, any>): boolean => {
+  switch (result.type) {
+    case 'html':
+      return isString(result.html) && isAbsentOr(result.title, isString);
+    case 'text':
+      return isAbsentOr(result.links, arrayOf(isString));
+    case 'search':
+      return isString(result.query) && arrayOf(isSearchHit)(result.results);
+    case 'audio':
+      return isString(result.audioUri);
+    case 'error':
+      return isString(result.errorMessage);
+    default:
+      return false;
+  }
+};
+
+const isTalentResult = (value: unknown): value is TalentResult =>
+  isPlainObject(value) && isString(value.summary) && hasResultFields(value);
+
+const isToolOutcome = (value: unknown): value is AgentToolOutcome =>
+  isPlainObject(value) &&
+  isString(value.callId) &&
+  isString(value.toolName) &&
+  isString(value.responseContent) &&
+  isTalentResult(value.result);
+
+const isAgentStep = (step: unknown): step is AgentStep =>
+  isPlainObject(step) &&
+  isAbsentOr(step.content, isString) &&
+  isAbsentOr(step.reasoningContent, isString) &&
+  isAbsentOr(step.toolCalls, arrayOf(isToolCall)) &&
+  isAbsentOr(step.toolOutcomes, arrayOf(isToolOutcome));
+
+const importedSteps = (steps: unknown, text?: string): AgentStep[] => {
+  const valid = Array.isArray(steps) ? steps.filter(isAgentStep) : [];
+  if (valid.length > 0) {
+    return valid;
+  }
+  return typeof text === 'string' && text.length > 0 ? [{content: text}] : [];
+};
+
+const toMessage = (msg: ImportedMessage): MessageType.Any => {
+  const base = {
+    id: msg.id,
+    author: {id: msg.author},
+    createdAt: msg.createdAt || Date.now(),
+  };
+  if (msg.type === 'assistant_turn') {
+    const {steps, ...metadata} = isPlainObject(msg.metadata)
+      ? msg.metadata
+      : {};
+    return {
+      ...base,
+      type: 'assistant_turn',
+      steps: importedSteps(steps, msg.text),
+      metadata,
+    };
+  }
+  return {
+    ...base,
+    text: msg.text || '',
+    type: msg.type as any,
+    metadata: msg.metadata || {},
+  } as MessageType.Any;
+};
+
+/**
+ * Import a single chat session
+ */
+const importSingleSession = async (
+  session: ImportedChatSession,
+): Promise<void> => {
+  try {
+    const messages = session.messages.map(toMessage);
+
+    // Create a new session in the database
+    await chatSessionRepository.createSession(
+      session.title,
+      messages,
+      session.completionSettings,
+      session.activePalId,
+    );
+  } catch (error) {
+    console.error('Error importing single session:', error);
+    throw error;
+  }
+};
+
+/**
+ * Interface (Data Transfer Object (DTO)) for imported pal data (format v2.0)
+ */
+export interface ImportedPal {
+  version: string;
+  id: string;
+  name: string;
+  description?: string;
+  thumbnail_url?: string;
+  thumbnail_data?: string; // Base64 embedded image data
+  systemPrompt: string;
+  originalSystemPrompt?: string;
+  isSystemPromptChanged: boolean;
+  useAIPrompt: boolean;
+  defaultModel?: any;
+  promptGenerationModel?: any;
+  generatingPrompt?: string;
+  color?: [string, string];
+  capabilities?: any;
+  // Talent set + greeting; round-tripped from exportUtils since migration v7+
+  // promoted them to first-class persisted state. Optional on read so legacy
+  // exports without these fields still validate.
+  pact?: Pal['pact'];
+  greeting?: Pal['greeting'];
+  parameters: Record<string, any>;
+  parameterSchema: ParameterDefinition[];
+  source: 'local' | 'palshub';
+  palshub_id?: string;
+  creator_info?: any;
+  categories?: string[];
+  tags?: string[];
+  rating?: number;
+  review_count?: number;
+  protection_level?: string;
+  price_cents?: number;
+  is_owned?: boolean;
+  generation_settings?: any;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/**
+ * Import pals from a JSON file (single or multiple)
+ */
+export const importPals = async (): Promise<number> => {
+  try {
+    // Pick a JSON file
+    const fileUri = await pickJsonFile();
+    if (!fileUri) {
+      return 0;
+    }
+
+    const data = await readJsonFile(fileUri);
+    const validatedData = validateImportedPalData(data);
+
+    if (Array.isArray(validatedData)) {
+      let importedCount = 0;
+      for (const pal of validatedData) {
+        await importSinglePal(pal);
+        importedCount++;
+      }
+      return importedCount;
+    } else {
+      await importSinglePal(validatedData);
+      return 1;
+    }
+  } catch (error) {
+    console.error('Error importing pals:', error);
+    throw error;
+  }
+};
+
+/**
+ * Validate imported pal data (handles both legacy and modern formats)
+ */
+export const validateImportedPalData = (
+  data: any,
+): ImportedPal | ImportedPal[] => {
+  // Check if it's an array or a single object
+  if (Array.isArray(data)) {
+    // Validate each pal in the array
+    return data.map(pal => validateSinglePal(pal));
+  } else {
+    // Validate a single pal
+    return validateSinglePal(data);
+  }
+};
+
+/**
+ * Validate a single pal (modern format v2.0+ only)
+ */
+const validateSinglePal = (pal: any): ImportedPal => {
+  // Check required fields
+  if (!pal.name || typeof pal.name !== 'string') {
+    throw new Error('Import failed: Invalid pal data');
+  }
+
+  if (!pal.systemPrompt || typeof pal.systemPrompt !== 'string') {
+    throw new Error('Import failed: Invalid pal data');
+  }
+
+  if (!pal.version || !pal.version.startsWith('2.')) {
+    throw new Error('Import failed: Unsupported format');
+  }
+
+  if (typeof pal.useAIPrompt !== 'boolean') {
+    pal.useAIPrompt = false;
+  }
+
+  if (typeof pal.isSystemPromptChanged !== 'boolean') {
+    pal.isSystemPromptChanged = false;
+  }
+
+  if (!pal.parameters || typeof pal.parameters !== 'object') {
+    pal.parameters = {};
+  }
+
+  if (!pal.parameterSchema || !Array.isArray(pal.parameterSchema)) {
+    pal.parameterSchema = [];
+  }
+
+  if (!pal.source) {
+    pal.source = 'local';
+  }
+
+  if (!pal.id) {
+    pal.id = uuidv4();
+  }
+
+  return pal as ImportedPal;
+};
+
+/**
+ * Save base64 image data as a local file
+ */
+const saveBase64Image = async (
+  base64Data: string,
+  palId: string,
+): Promise<string> => {
+  // Extract extension and base64 content from data URL
+  const extensionMatch = base64Data.match(/^data:image\/([a-z]+);base64,/);
+  const fileExtension = extensionMatch ? extensionMatch[1] : 'jpg'; // Fallback to jpg
+  const base64Content = base64Data.replace(/^data:image\/[a-z]+;base64,/, '');
+
+  // Use same directory and naming convention as imageUtils.ts
+  const PAL_IMAGES_DIR = `${RNFS.DocumentDirectoryPath}/pal-images`;
+  const fileName = `${palId}_thumbnail.${fileExtension}`;
+  const filePath = getAbsoluteThumbnailPath(fileName);
+  if (!filePath) {
+    throw new Error(`Invalid thumbnail filename: ${fileName}`);
+  }
+
+  // Ensure directory exists (same as imageUtils.ts)
+  const exists = await RNFS.exists(PAL_IMAGES_DIR);
+  if (!exists) {
+    await RNFS.mkdir(PAL_IMAGES_DIR);
+  }
+
+  // Write base64 data to file
+  await RNFS.writeFile(filePath, base64Content, 'base64');
+
+  // Return filename for storage
+  return fileName;
+};
+
+const keepRemoteThumbnailUrl = (url: unknown): string | undefined =>
+  typeof url === 'string' && isRemoteThumbnailUrl(url) ? url : undefined;
+
+/**
+ * Transform imported pal to the format expected by palStore.createPal
+ */
+const transformImportPal = async (
+  pal: ImportedPal,
+): Promise<Omit<Pal, 'id' | 'created_at' | 'updated_at'>> => {
+  // Handle thumbnail image - save base64 data as local file if present
+  let thumbnailUrl = keepRemoteThumbnailUrl(pal.thumbnail_url);
+
+  if (pal.thumbnail_data) {
+    try {
+      // Generate new ID for this imported pal to avoid conflicts
+      const newPalId = uuidv4();
+      thumbnailUrl = await saveBase64Image(pal.thumbnail_data, newPalId);
+    } catch (error) {
+      console.warn('Failed to save imported thumbnail:', error);
+      thumbnailUrl = undefined; // Fall back to no thumbnail
+    }
+  }
+
+  return {
+    type: 'local',
+    name: pal.name,
+    description: pal.description,
+    thumbnail_url: thumbnailUrl,
+    systemPrompt: pal.systemPrompt,
+    originalSystemPrompt: pal.originalSystemPrompt,
+    isSystemPromptChanged: pal.isSystemPromptChanged,
+    useAIPrompt: pal.useAIPrompt,
+    defaultModel: pal.defaultModel,
+    promptGenerationModel: pal.promptGenerationModel,
+    generatingPrompt: pal.generatingPrompt,
+    color: pal.color,
+    capabilities: pal.capabilities || {},
+    pact: pal.pact,
+    greeting: pal.greeting,
+    parameters: pal.parameters,
+    parameterSchema: pal.parameterSchema,
+    source: pal.source,
+    palshub_id: pal.palshub_id,
+    creator_info: pal.creator_info,
+    categories: pal.categories,
+    tags: pal.tags,
+    rating: pal.rating,
+    review_count: pal.review_count,
+    protection_level: pal.protection_level as
+      | 'public'
+      | 'reveal_on_purchase'
+      | 'private'
+      | undefined,
+    price_cents: pal.price_cents,
+    is_owned: pal.is_owned,
+    completionSettings: pal.generation_settings,
+  };
+};
+
+/**
+ * Import a single pal
+ */
+const importSinglePal = async (pal: ImportedPal): Promise<void> => {
+  try {
+    const palData = await transformImportPal(pal);
+
+    await palStore.createPal(palData);
+  } catch (error) {
+    console.error('Error importing single pal:', error);
+    throw error;
+  }
+};

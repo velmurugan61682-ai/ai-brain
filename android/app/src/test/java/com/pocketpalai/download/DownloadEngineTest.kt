@@ -1,0 +1,883 @@
+package com.pocketpal.download
+
+import androidx.test.core.app.ApplicationProvider
+import com.pocketpal.download.DownloadEngine.Outcome
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
+import okio.Buffer
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.io.File
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLPeerUnverifiedException
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
+class DownloadEngineTest {
+    @get:Rule
+    val tmp = TemporaryFolder()
+
+    private val server = MockWebServer()
+    private val database = inMemoryDatabase(ApplicationProvider.getApplicationContext())
+    private val dao = database.downloadDao()
+    private val runs = DownloadRuns()
+    private var clock = 0L
+    private val content = ByteArray(300_000) { (it % 251).toByte() }.also { GGUF.copyInto(it) }
+    private var destinationName = "model.gguf"
+    private val destination by lazy { File(tmp.root, destinationName) }
+    private val part by lazy { File(destination.path + DownloadEngine.PART_SUFFIX) }
+    private val requests = mutableListOf<RecordedRequest>()
+
+    @After
+    fun tearDown() {
+        runCatching { server.shutdown() }
+        database.close()
+    }
+
+    private fun engine(
+        client: OkHttpClient = DownloadEngine.sharedClient,
+        openPart: ((File, Boolean) -> java.io.OutputStream)? = null,
+    ) = if (openPart == null) {
+        DownloadEngine(dao, runs, client, now = { clock }, sleep = { clock += it })
+    } else {
+        DownloadEngine(dao, runs, client, now = { clock }, sleep = { clock += it }, openPart = openPart)
+    }
+
+    private fun insert(
+        id: String = ID,
+        status: DownloadStatus = DownloadStatus.QUEUED,
+        totalBytes: Long = 0,
+        etag: String? = null,
+        createdAt: Long = 1,
+        stalledRuns: Int = 0,
+    ) = runBlocking {
+        dao.insertDownload(
+            downloadRow(
+                id, destination.path, status, url = server.url(RESOLVE_PATH).toString(),
+                totalBytes = totalBytes, createdAt = createdAt, etag = etag, stalledRuns = stalledRuns,
+            )
+        )
+    }
+
+    private fun row(id: String = ID) = runBlocking { dao.getDownload(id)!! }
+
+    private fun run(engine: DownloadEngine = engine(), interval: Long = 1_000): Outcome = runBlocking {
+        engine.run(ID, runs.register(ID), interval)
+    }
+
+    private fun serve(vararg steps: (RecordedRequest) -> MockResponse, linkedSize: Int? = null) {
+        val queue = ArrayDeque(steps.toList())
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = synchronized(queue) {
+                requests += request
+                if (linkedSize != null && request.path == RESOLVE_PATH) return resolveRedirect(linkedSize)
+                (if (queue.size > 1) queue.removeFirst() else queue.first())(request)
+            }
+        }
+    }
+
+    private fun resolveRedirect(linkedSize: Int) = MockResponse()
+        .setResponseCode(302)
+        .setHeader("content-type", "text/plain; charset=utf-8")
+        .setHeader("location", CDN_PATH)
+        .setHeader("x-linked-size", linkedSize)
+        .setHeader("x-linked-etag", HF_LINKED_ETAG)
+        .setBody("Found. Redirecting to $CDN_PATH")
+
+    private fun cdn(body: ByteArray = content) = MockResponse()
+        .setHeader("content-type", "application/octet-stream")
+        .setHeader("etag", HF_ETAG)
+        .setBody(Buffer().write(body))
+
+    private fun cdnRequests() = requests.filter { it.path == CDN_PATH }
+
+    private fun honest(etag: String? = E1, body: ByteArray = content): (RecordedRequest) -> MockResponse = { request ->
+        val from = request.getHeader("Range")?.removePrefix("bytes=")?.removeSuffix("-")?.toInt()
+        val response = if (from == null) {
+            MockResponse().setBody(Buffer().write(body))
+        } else {
+            partial(from, body)
+        }
+        etag?.let { response.setHeader("ETag", it) }
+        response
+    }
+
+    private fun partial(from: Int, body: ByteArray = content, total: Int = body.size) = MockResponse()
+        .setResponseCode(206)
+        .setHeader("Content-Range", "bytes $from-${body.size - 1}/$total")
+        .setBody(Buffer().write(body.copyOfRange(from, body.size)))
+
+    private fun writePart(bytes: Int) = part.writeBytes(content.copyOfRange(0, bytes))
+
+    private fun seed(bytes: Int) = ByteArray(bytes) { 7 }.also { GGUF.copyInto(it) }
+
+    private fun blockedPageBytes() = javaClass.getResourceAsStream("/download/blocked-page.html")!!.readBytes()
+
+    private fun blockedPage() = MockResponse()
+        .setHeader("Content-Type", "text/html; charset=utf-8")
+        .setBody(Buffer().write(blockedPageBytes()))
+
+    private fun assertPartialKept(error: String) {
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(error, row().error)
+        assertFalse(destination.exists())
+        assertArrayEquals(content.copyOfRange(0, 100_000), part.readBytes())
+        assertEquals(content.size.toLong(), row().totalBytes)
+        assertEquals(E1, row().etag)
+        assertEquals(100_000L, row().downloadedBytes)
+    }
+
+    private fun awaitPartBytes() {
+        val deadline = System.currentTimeMillis() + 10_000
+        while (!(part.exists() && part.length() > 0)) {
+            check(System.currentTimeMillis() < deadline) { "no bytes written" }
+            Thread.sleep(20)
+        }
+    }
+
+    private fun throttled(periodMs: Long = 30_000) = MockResponse()
+        .setBody(Buffer().write(content))
+        .setHeader("ETag", E1)
+        .throttleBody(16 * 1024, periodMs, TimeUnit.MILLISECONDS)
+
+    private fun assertCompleted() {
+        assertEquals(DownloadStatus.COMPLETED, row().status)
+        assertArrayEquals(content, destination.readBytes())
+        assertFalse(part.exists())
+    }
+
+    @Test
+    fun droppedBodyResumesWithRange() {
+        insert()
+        serve({ honest()(it).setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY) }, honest())
+
+        assertEquals(Outcome.DONE, run())
+
+        assertCompleted()
+        val resumed = requests.last().getHeader("Range")!!
+        assertTrue(resumed, resumed.matches(Regex("bytes=[1-9]\\d*-")))
+        assertEquals(E1, requests.last().getHeader("If-Range"))
+        assertEquals(E1, row().etag)
+        assertEquals(content.size.toLong(), row().totalBytes)
+    }
+
+    @Test
+    fun changedEtagOnResumeRestartsFromZero() {
+        val changed = content.reversedArray().also { GGUF.copyInto(it) }
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        writePart(100)
+        serve(honest(etag = E2, body = changed))
+
+        run()
+
+        assertEquals(2, requests.size)
+        assertNull(requests[1].getHeader("Range"))
+        assertArrayEquals(changed, destination.readBytes())
+        assertEquals(E2, row().etag)
+    }
+
+    @Test
+    fun fullResponseOnResumeTruncatesAndRewrites() {
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        part.writeBytes(seed(100))
+        serve({ MockResponse().setBody(Buffer().write(content)).setHeader("ETag", E2) })
+
+        run()
+
+        assertEquals(1, requests.size)
+        assertCompleted()
+        assertEquals(E2, row().etag)
+        assertEquals(content.size.toLong(), row().totalBytes)
+    }
+
+    @Test
+    fun webPageOnAFreshStartIsNeverCommitted() {
+        insert()
+        serve({ blockedPage() })
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.NOT_MODEL_ERROR, row().error)
+        assertFalse(destination.exists())
+        assertFalse(part.exists())
+    }
+
+    @Test
+    fun webPageAnsweringAResumeIsNeverCommitted() {
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        writePart(100_000)
+        serve({ blockedPage() })
+
+        assertEquals(Outcome.DONE, run())
+
+        assertPartialKept(DownloadEngine.NOT_MODEL_ERROR)
+    }
+
+    @Test
+    fun hfDownloadCommitsAtTheLinkedSize() {
+        insert()
+        serve({ cdn() }, linkedSize = content.size)
+
+        assertEquals(Outcome.DONE, run())
+
+        assertCompleted()
+        assertEquals(listOf(RESOLVE_PATH, CDN_PATH), requests.map { it.path })
+        assertEquals(content.size.toLong(), row().totalBytes)
+        assertEquals(HF_ETAG, row().etag)
+    }
+
+    @Test
+    fun hfDownloadResumesThroughTheRedirect() {
+        insert()
+        serve(
+            { cdn().setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY) },
+            honest(etag = HF_ETAG),
+            linkedSize = content.size,
+        )
+
+        assertEquals(Outcome.DONE, run())
+
+        assertCompleted()
+        assertTrue(cdnRequests().last().getHeader("Range")!!.matches(Regex("bytes=[1-9]\\d*-")))
+    }
+
+    @Test
+    fun bodyOfAnotherLengthThanTheLinkedSizeIsNeverWritten() {
+        insert()
+        serve({ cdn(blockedPageBytes()) }, linkedSize = content.size)
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.SIZE_MISMATCH_ERROR, row().error)
+        assertEquals(1, cdnRequests().size)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun bodyOfAnotherLengthAnsweringAResumeKeepsThePartial() {
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        writePart(100_000)
+        serve({ cdn(blockedPageBytes()) }, linkedSize = content.size)
+
+        assertEquals(Outcome.DONE, run())
+
+        assertPartialKept(DownloadEngine.SIZE_MISMATCH_ERROR)
+    }
+
+    @Test
+    fun emptyBodyAnsweringAResumeKeepsThePartial() {
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        writePart(100_000)
+        serve({ cdn(ByteArray(0)) }, linkedSize = content.size)
+
+        assertEquals(Outcome.DONE, run())
+
+        assertPartialKept(DownloadEngine.SIZE_MISMATCH_ERROR)
+    }
+
+    @Test
+    fun chunkedBodyShorterThanTheLinkedSizeIsNeverCommitted() {
+        insert()
+        serve({ cdn().setChunkedBody(Buffer().write(blockedPageBytes()), 1024) }, linkedSize = content.size)
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.SIZE_MISMATCH_ERROR, row().error)
+        assertEquals(content.size.toLong(), row().totalBytes)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun changedFileBehindTheRedirectRestartsAtItsNewSize() {
+        val changed = content.copyOf(content.size + 1_000)
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        writePart(100)
+        serve({ cdn(changed).setHeader("etag", E2) }, linkedSize = changed.size)
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.COMPLETED, row().status)
+        assertArrayEquals(changed, destination.readBytes())
+        assertEquals(changed.size.toLong(), row().totalBytes)
+        assertEquals(E2, row().etag)
+        assertEquals("bytes=100-", cdnRequests().single().getHeader("Range"))
+    }
+
+    @Test
+    fun errorBodyToAModelFileIsNeverCommitted() {
+        insert()
+        serve({ MockResponse().setHeader("Content-Type", "application/json").setBody(JSON_ERROR) })
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.NOT_MODEL_ERROR, row().error)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun modelFileSuffixIgnoresCase() {
+        destinationName = "Model.GGUF"
+        insert()
+        serve({ MockResponse().setBody(JSON_ERROR) })
+
+        run()
+
+        assertEquals(DownloadEngine.NOT_MODEL_ERROR, row().error)
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun otherFileTypesAreNotCheckedForTheMagic() {
+        destinationName = "model.bin"
+        val body = content.reversedArray()
+        insert()
+        serve({ MockResponse().setHeader("Content-Type", "application/octet-stream").setBody(Buffer().write(body)) })
+
+        run()
+
+        assertEquals(DownloadStatus.COMPLETED, row().status)
+        assertArrayEquals(body, destination.readBytes())
+    }
+
+    @Test
+    fun webPageToAnyFileTypeIsRejectedBeforeAnyWrite() {
+        destinationName = "model.bin"
+        insert()
+        serve({ blockedPage() })
+
+        run()
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.NOT_MODEL_ERROR, row().error)
+        assertEquals(0L, row().totalBytes)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun webPageBehindTheRedirectIsRejectedAsAPage() {
+        insert()
+        serve({ blockedPage() }, linkedSize = content.size)
+
+        run()
+
+        assertEquals(DownloadEngine.NOT_MODEL_ERROR, row().error)
+        assertFalse(part.exists())
+    }
+
+    @Test
+    fun zeroLinkedSizeCountsAsUnknown() {
+        insert()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requests += request
+                return if (request.path == RESOLVE_PATH) {
+                    resolveRedirect(content.size).setHeader("x-linked-size", "0")
+                } else {
+                    cdn()
+                }
+            }
+        }
+
+        run()
+
+        assertCompleted()
+        assertEquals(content.size.toLong(), row().totalBytes)
+    }
+
+    @Test
+    fun linkedSizeIsReadFromAnEarlierRedirectInTheChain() {
+        insert()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requests += request
+                return when (request.path) {
+                    RESOLVE_PATH -> resolveRedirect(content.size).setHeader("location", "/hop")
+                    "/hop" -> MockResponse().setResponseCode(302).setHeader("location", CDN_PATH)
+                    else -> cdn(blockedPageBytes())
+                }
+            }
+        }
+
+        run()
+
+        assertEquals(DownloadEngine.SIZE_MISMATCH_ERROR, row().error)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun bodyShorterThanTheMagicIsNeverCommitted() {
+        insert()
+        serve({ MockResponse().setHeader("Content-Type", "application/octet-stream").setBody("GG") })
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.NOT_MODEL_ERROR, row().error)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun resumedPartialWithoutTheMagicIsNeverCommitted() {
+        val body = content.copyOf().also { "ABCD".toByteArray().copyInto(it) }
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        part.writeBytes(body.copyOfRange(0, 100))
+        serve({ partial(100, body = body).setHeader("ETag", E1) })
+
+        run()
+
+        assertEquals(DownloadEngine.NOT_MODEL_ERROR, row().error)
+        assertEquals("bytes=100-", requests.single().getHeader("Range"))
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun secondValidatorMismatchInOneRunFails() {
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        writePart(100)
+        serve(
+            { partial(100).setHeader("ETag", E2) },
+            { honest(etag = E2)(it).setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY) },
+            { partial(it.getHeader("Range")!!.removePrefix("bytes=").removeSuffix("-").toInt()).setHeader("ETag", E3) },
+        )
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.REMOTE_CHANGED_ERROR, row().error)
+        assertEquals(0L, row().downloadedBytes)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun contentRangeTotalMismatchIsNeverAppended() {
+        insert(totalBytes = content.size.toLong())
+        part.writeBytes(seed(100))
+        serve({ partial(100, total = content.size + 5) }, honest())
+
+        run()
+
+        assertNull(requests[1].getHeader("Range"))
+        assertCompleted()
+    }
+
+    @Test
+    fun contentRangeStartMismatchIsNeverAppended() {
+        insert(totalBytes = content.size.toLong())
+        part.writeBytes(seed(100))
+        serve({ partial(50) }, honest())
+
+        run()
+
+        assertNull(requests[1].getHeader("Range"))
+        assertCompleted()
+    }
+
+    @Test
+    fun shortBodyAtCleanEofFailsAndDeletesPart() {
+        insert(totalBytes = content.size.toLong())
+        writePart(100)
+        serve({
+            MockResponse()
+                .setResponseCode(206)
+                .setHeader("Content-Range", "bytes 100-${content.size - 1}/${content.size}")
+                .setChunkedBody(Buffer().write(content.copyOfRange(100, content.size - 10)), 4096)
+        })
+
+        run()
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.SIZE_MISMATCH_ERROR, row().error)
+        assertEquals(0L, row().downloadedBytes)
+        assertFalse(part.exists())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun fiveZeroByteRunsFail() {
+        insert()
+        serve({ MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) })
+
+        val outcomes = (1..5).map { run() }
+
+        assertEquals(List(4) { Outcome.RESCHEDULE } + Outcome.DONE, outcomes)
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.STALLED_ERROR, row().error)
+        assertEquals(5, row().stalledRuns)
+        assertTrue(row().failureUnreported)
+    }
+
+    @Test
+    fun stallBoundFailureRecordsTheKeptPart() {
+        insert(stalledRuns = DownloadEngine.MAX_STALLED_RUNS - 1)
+        writePart(100)
+        serve({ MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) })
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.MAX_STALLED_RUNS, row().stalledRuns)
+        assertEquals(100L, row().downloadedBytes)
+        assertEquals(100L, part.length())
+    }
+
+    @Test
+    fun runThatWroteBytesResetsTheStallCount() {
+        insert(stalledRuns = 4)
+        serve(
+            { honest()(it).setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY) },
+            { MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST) },
+        )
+
+        assertEquals(Outcome.RESCHEDULE, run())
+
+        assertEquals(DownloadStatus.QUEUED, row().status)
+        assertEquals(0, row().stalledRuns)
+        assertTrue(part.length() > 0)
+    }
+
+    @Test
+    fun notFoundFailsAfterOneRequest() {
+        insert()
+        serve({ MockResponse().setResponseCode(404) })
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(1, requests.size)
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals("Client error: 404", row().error)
+        assertTrue(row().failureUnreported)
+    }
+
+    @Test
+    fun retryableStatusCodesResumeWithRange() {
+        for (code in listOf(408, 429, 503)) {
+            requests.clear()
+            destination.delete()
+            insert(totalBytes = content.size.toLong(), etag = E1)
+            writePart(100)
+            serve({ MockResponse().setResponseCode(code) }, honest())
+
+            run()
+
+            assertEquals("bytes=100-", requests[1].getHeader("Range"))
+            assertCompleted()
+        }
+    }
+
+    @Test
+    fun partWriteFailureIsPermanentAndKeepsPart() {
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        writePart(100)
+        serve(honest())
+
+        run(engine(openPart = { _, _ -> throw IOException("No space left on device") }))
+
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertTrue(row().error!!.contains("No space left on device"))
+        assertEquals(100L, part.length())
+        assertEquals(100L, row().downloadedBytes)
+        assertEquals(1, requests.size)
+    }
+
+    private class FullDisk(
+        file: File,
+        append: Boolean,
+        private val capacity: Long = Long.MAX_VALUE,
+        private val flushesBeforeFull: Int = Int.MAX_VALUE,
+        private val failOnClose: Boolean = false,
+    ) : java.io.OutputStream() {
+        private val file = java.io.FileOutputStream(file, append)
+        var accepted = 0L
+            private set
+        private var flushes = 0
+
+        override fun write(b: Int) = write(byteArrayOf(b.toByte()), 0, 1)
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            if (accepted + len > capacity) throw IOException(NO_SPACE)
+            file.write(b, off, len)
+            accepted += len
+        }
+
+        override fun flush() {
+            if (++flushes > flushesBeforeFull) throw IOException(NO_SPACE)
+        }
+
+        override fun close() {
+            file.close()
+            if (failOnClose) throw IOException(NO_SPACE)
+        }
+    }
+
+    private fun runOutOfSpace(interval: Long, disk: (File, Boolean) -> FullDisk): FullDisk {
+        insert(totalBytes = content.size.toLong(), etag = E1)
+        serve(honest())
+        var opened: FullDisk? = null
+        assertEquals(Outcome.DONE, run(engine(openPart = { file, append -> disk(file, append).also { opened = it } }), interval))
+        return opened!!
+    }
+
+    private fun assertFailedOnStorage(disk: FullDisk) {
+        assertEquals(1, requests.size)
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertTrue(row().error!!.contains(NO_SPACE))
+        assertEquals(disk.accepted, part.length())
+        assertFalse(destination.exists())
+    }
+
+    @Test
+    fun fullDiskOnABufferedWriteFails() {
+        val disk = runOutOfSpace(interval = Long.MAX_VALUE) { file, append -> FullDisk(file, append, capacity = 100_000) }
+
+        assertFailedOnStorage(disk)
+        assertTrue(disk.accepted < content.size)
+    }
+
+    @Test
+    fun fullDiskOnAProgressFlushFails() {
+        val disk = runOutOfSpace(interval = 0) { file, append -> FullDisk(file, append, flushesBeforeFull = 1) }
+
+        assertFailedOnStorage(disk)
+        assertTrue(disk.accepted < content.size)
+    }
+
+    @Test
+    fun fullDiskOnTheFinalCloseFails() {
+        val disk = runOutOfSpace(interval = Long.MAX_VALUE) { file, append -> FullDisk(file, append, failOnClose = true) }
+
+        assertFailedOnStorage(disk)
+    }
+
+    @Test
+    fun unverifiedPeerIsPermanent() {
+        insert()
+        var attempts = 0
+        val client = DownloadEngine.sharedClient.newBuilder()
+            .addInterceptor(Interceptor {
+                attempts++
+                throw SSLPeerUnverifiedException("peer not verified")
+            })
+            .build()
+
+        run(engine(client))
+
+        assertEquals(1, attempts)
+        assertEquals(DownloadStatus.FAILED, row().status)
+    }
+
+    @Test
+    fun unsatisfiableRangeAtFullLengthCommits() {
+        insert()
+        writePart(content.size)
+        serve({ MockResponse().setResponseCode(416).setHeader("Content-Range", "bytes */${content.size}") })
+
+        run()
+
+        assertEquals(1, requests.size)
+        assertCompleted()
+    }
+
+    @Test
+    fun unsatisfiableRangeWithOtherTotalRestarts() {
+        insert()
+        writePart(100)
+        serve({ MockResponse().setResponseCode(416).setHeader("Content-Range", "bytes */${content.size}") }, honest())
+
+        run()
+
+        assertNull(requests[1].getHeader("Range"))
+        assertCompleted()
+    }
+
+    @Test
+    fun inPlacePartialIsAdoptedAndResumed() {
+        insert(status = DownloadStatus.RUNNING, totalBytes = content.size.toLong())
+        destination.writeBytes(content.copyOfRange(0, 100))
+        serve(honest())
+
+        run()
+
+        assertEquals("bytes=100-", requests.single().getHeader("Range"))
+        assertNull(requests.single().getHeader("If-Range"))
+        assertCompleted()
+    }
+
+    @Test
+    fun fullLengthInPlaceFileCommitsWithoutARequest() {
+        insert(status = DownloadStatus.RUNNING, totalBytes = content.size.toLong())
+        destination.writeBytes(content)
+        serve(honest())
+
+        assertEquals(Outcome.DONE, run())
+
+        assertEquals(0, requests.size)
+        assertCompleted()
+        assertEquals(content.size.toLong(), row().downloadedBytes)
+    }
+
+    @Test
+    fun inPlaceFileOfUnknownSizeIsNeverSplicedIntoANewDownload() {
+        insert(status = DownloadStatus.RUNNING)
+        destination.writeBytes(seed(100))
+        serve({ partial(it.getHeader("Range")?.removePrefix("bytes=")?.removeSuffix("-")?.toInt() ?: 0) })
+
+        run()
+
+        assertNull(requests.single().getHeader("Range"))
+        assertCompleted()
+    }
+
+    @Test
+    fun newerCompletedRowSupersedesAdoption() = runBlocking {
+        insert(status = DownloadStatus.RUNNING, createdAt = 1)
+        insert(id = "newer", status = DownloadStatus.COMPLETED, createdAt = 2)
+        destination.writeBytes(content)
+
+        run()
+
+        assertEquals(0, requests.size)
+        assertEquals(DownloadStatus.CANCELLED, row().status)
+        assertArrayEquals(content, destination.readBytes())
+        assertFalse(part.exists())
+    }
+
+    @Test
+    fun resumeWaitsForTheUnwindingRunsStopWrite() = runBlocking {
+        insert()
+        serve({ throttled() }, honest())
+        val first = async(Dispatchers.Default) { engine().run(ID, runs.register(ID), 0) }
+        awaitPartBytes()
+
+        dao.casStatus(ID, listOf("RUNNING"), DownloadStatus.PAUSED)
+        runs.stop(ID)
+        dao.casStatus(ID, listOf("PAUSED"), DownloadStatus.QUEUED)
+        val second = async(Dispatchers.Default) { engine().run(ID, runs.register(ID), 1_000) }
+
+        assertEquals(Outcome.DONE, first.await())
+        assertEquals(Outcome.DONE, second.await())
+        assertTrue(requests.last().getHeader("Range")!!.startsWith("bytes="))
+        assertCompleted()
+    }
+
+    @Test
+    fun pausedRowReceivesNoEngineWrite() = runBlocking {
+        insert()
+        serve({ throttled(periodMs = 100) })
+        val running = async(Dispatchers.Default) { engine().run(ID, runs.register(ID), 0) }
+        awaitPartBytes()
+
+        dao.casStatus(ID, listOf("RUNNING"), DownloadStatus.PAUSED)
+        val pausedAt = row().downloadedBytes
+
+        withTimeout(10_000) { running.await() }
+        assertEquals(DownloadStatus.PAUSED, row().status)
+        assertEquals(pausedAt, row().downloadedBytes)
+        assertFalse(destination.exists())
+        assertTrue(part.exists())
+    }
+
+    @Test
+    fun systemStopMidBodyRequeuesAndKeepsPart() = runBlocking {
+        insert()
+        serve({ throttled() })
+        val running = async(Dispatchers.Default) { engine().run(ID, runs.register(ID), 0) }
+        awaitPartBytes()
+
+        runs.stop(ID)
+
+        assertEquals(Outcome.RESCHEDULE, withTimeout(5_000) { running.await() })
+        assertEquals(DownloadStatus.QUEUED, row().status)
+        assertTrue(part.length() > 0)
+    }
+
+    @Test
+    fun cancelledCoroutineStopsTheBlockedCallPromptly() = runBlocking {
+        insert()
+        serve({ throttled() })
+        val signal = runs.register(ID)
+        val job = launch(Dispatchers.Default) { engine().run(ID, signal, 0) }
+        awaitPartBytes()
+
+        val started = System.nanoTime()
+        job.cancelAndJoin()
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+
+        assertTrue("took $elapsedMs ms", elapsedMs < 5_000)
+        assertTrue(signal.stopped)
+        assertFalse(signal.userStop)
+        assertEquals(DownloadStatus.QUEUED, row().status)
+        assertTrue(part.length() > 0)
+        withTimeout(1_000) { runs.withDestinationLock(destination.path) {} }
+    }
+
+    @Test
+    fun userStopFailsAndAwaitsReporting() = runBlocking {
+        insert()
+        serve({ throttled() })
+        val signal = runs.register(ID)
+        val running = async(Dispatchers.Default) { engine().run(ID, signal, 0) }
+        awaitPartBytes()
+
+        signal.stop(user = true)
+
+        assertEquals(Outcome.DONE, withTimeout(5_000) { running.await() })
+        assertEquals(DownloadStatus.FAILED, row().status)
+        assertEquals(DownloadEngine.STOPPED_ERROR, row().error)
+        assertTrue(row().failureUnreported)
+        assertTrue(part.length() > 0)
+        assertEquals(part.length(), row().downloadedBytes)
+    }
+
+    @Test
+    fun sharedClientWaitsSixtySecondsForData() {
+        assertEquals(60_000, DownloadEngine.sharedClient.readTimeoutMillis)
+    }
+
+    private companion object {
+        const val ID = "download-1"
+        const val E1 = "\"etag-1\""
+        const val E2 = "\"etag-2\""
+        const val E3 = "\"etag-3\""
+        const val NO_SPACE = "No space left on device"
+        val GGUF = "GGUF".toByteArray()
+        const val JSON_ERROR = "{\"error\":\"Access to this resource is restricted on your network. Contact your administrator.\"}"
+        const val RESOLVE_PATH = "/model.gguf"
+        const val CDN_PATH = "/xet-bridge-us/69a591f0311144ce3c262890/d97438bd"
+        const val HF_ETAG = "\"d97438bdfb705334a9ec568ec87f57f2d6929da2bccf7e61bab37ee002e75533\""
+        const val HF_LINKED_ETAG = "\"0bfe35afc9f05b7fac3fa04925e051ac7939a42a8a17ea11afc99701bea826cc\""
+    }
+}

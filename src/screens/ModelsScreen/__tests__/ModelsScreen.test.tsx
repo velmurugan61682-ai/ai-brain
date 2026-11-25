@@ -1,0 +1,598 @@
+import React from 'react';
+import {Alert} from 'react-native';
+
+import * as RNFS from '@dr.pogodin/react-native-fs';
+import {pick} from '@react-native-documents/picker';
+import {
+  fireEvent,
+  render as baseRender,
+  waitFor,
+  act,
+} from '../../../../jest/test-utils';
+
+import {ModelsScreen} from '../ModelsScreen';
+
+import {modelStore, uiStore} from '../../../store';
+import {
+  basicModel,
+  downloadedModel,
+  hfModel1,
+  hfModel2,
+} from '../../../../jest/fixtures/models';
+
+const render = (ui: React.ReactElement, options: any = {}) =>
+  baseRender(ui, {
+    withBottomSheetProvider: true,
+    withNavigation: true,
+    ...options,
+  });
+
+jest.useFakeTimers();
+
+describe('ModelsScreen', () => {
+  beforeEach(() => {
+    //(useTheme as jest.Mock).mockReturnValue(mockTheme);
+    jest.clearAllMocks();
+  });
+
+  it('renders correctly', async () => {
+    const {getByTestId} = render(<ModelsScreen />);
+    expect(getByTestId('flat-list')).toBeTruthy();
+    expect(getByTestId('fab-group')).toBeTruthy();
+  });
+
+  it('refreshes models on pull-to-refresh', async () => {
+    const {getByTestId} = render(<ModelsScreen />);
+
+    const flatList = getByTestId('flat-list');
+    const refreshControl = flatList.props.refreshControl;
+    await act(async () => {
+      refreshControl.props.onRefresh();
+    });
+
+    expect(modelStore.refreshDownloadStatuses).toHaveBeenCalled();
+  });
+
+  it('opens HF model search when the HF FAB is pressed', async () => {
+    const {getByTestId} = render(<ModelsScreen />);
+
+    // Open the FAB group
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+
+    // Wait for the FAB group to open and its children to be accessible
+    await waitFor(() => {
+      const hfFab = getByTestId('hf-fab', {includeHiddenElements: true});
+      expect(hfFab).toBeTruthy();
+    });
+    const hfFab = getByTestId('hf-fab', {includeHiddenElements: true});
+
+    await act(async () => {
+      fireEvent.press(hfFab);
+    });
+
+    // Verify HFModelSearch is rendered
+    await waitFor(() => {
+      const hfModelSearch = getByTestId('hf-model-search-view');
+      expect(hfModelSearch).toBeTruthy();
+    });
+  });
+
+  it('adds a local model when the plus FAB is pressed', async () => {
+    (pick as jest.Mock).mockResolvedValue([
+      {
+        uri: '/mock/file/path',
+        name: 'mockModelFile.bin',
+      },
+    ]);
+
+    // Mock RNFS.exists to return false for the destination path so no alert is shown
+    (RNFS.exists as jest.Mock).mockImplementation(async (path: string) => {
+      if (path.includes('/path/to/documents/models/local/mockModelFile.bin')) {
+        return false; // File doesn't exist, so no alert will be shown
+      }
+      return true; // Other paths exist by default
+    });
+
+    const {getByTestId} = render(<ModelsScreen />);
+
+    // Open the FAB group
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+
+    // Wait for the FAB group to open and its children to be accessible
+    await waitFor(() => {
+      const localFab = getByTestId('local-fab', {includeHiddenElements: true});
+      expect(localFab).toBeTruthy();
+    });
+    const addLocalModelButton = getByTestId('local-fab', {
+      includeHiddenElements: true,
+    });
+
+    await act(async () => {
+      if (addLocalModelButton) {
+        fireEvent.press(addLocalModelButton);
+      }
+    });
+
+    await waitFor(() => {
+      expect(pick).toHaveBeenCalled();
+      expect(RNFS.copyFile).toHaveBeenCalledWith(
+        '/mock/file/path',
+        '/path/to/documents/models/local/mockModelFile.bin',
+      );
+      expect(modelStore.addLocalModel).toHaveBeenCalledWith(
+        '/path/to/documents/models/local/mockModelFile.bin',
+      );
+    });
+  });
+
+  describe('iOS backup exclusion of an imported model', () => {
+    const modelsRoot = `${RNFS.DocumentDirectoryPath}/models`;
+    const localDir = `${modelsRoot}/local`;
+    const target = `${localDir}/mockModelFile.gguf`;
+
+    let warn: jest.SpyInstance;
+    beforeEach(() => {
+      warn = jest.spyOn(console, 'warn');
+    });
+    afterEach(() => {
+      warn.mockRestore();
+      (RNFS.mkdir as jest.Mock).mockReset();
+    });
+
+    const importWith = async (localDirExists: boolean) => {
+      (pick as jest.Mock).mockResolvedValue([
+        {uri: '/mock/file/path', name: 'mockModelFile.gguf'},
+      ]);
+      (RNFS.exists as jest.Mock).mockImplementation(async (path: string) => {
+        if (path === target) {
+          return false;
+        }
+        if (path === localDir) {
+          return localDirExists;
+        }
+        return true;
+      });
+      const {getByTestId} = render(<ModelsScreen />);
+      fireEvent.press(getByTestId('fab-group'));
+      await waitFor(() =>
+        expect(
+          getByTestId('local-fab', {includeHiddenElements: true}),
+        ).toBeTruthy(),
+      );
+      await act(async () => {
+        fireEvent.press(
+          getByTestId('local-fab', {includeHiddenElements: true}),
+        );
+      });
+      await waitFor(() =>
+        expect(RNFS.copyFile).toHaveBeenCalledWith('/mock/file/path', target),
+      );
+    };
+
+    it.each([
+      ['does not exist yet', false],
+      ['already exists', true],
+    ])(
+      'flags the local models folder before the copy when it %s',
+      async (_state, localDirExists) => {
+        await importWith(localDirExists);
+
+        const mkdirMock = RNFS.mkdir as jest.Mock;
+        const flagged = mkdirMock.mock.calls
+          .map((call, i) => ({
+            path: call[0] as string,
+            excluded: call[1]?.NSURLIsExcludedFromBackupKey === true,
+            order: mkdirMock.mock.invocationCallOrder[i],
+          }))
+          .filter(
+            ({path, excluded}) =>
+              excluded &&
+              path.startsWith(modelsRoot) &&
+              (localDir === path || localDir.startsWith(`${path}/`)),
+          );
+        expect(flagged).not.toHaveLength(0);
+        const copyOrder = (RNFS.copyFile as jest.Mock).mock
+          .invocationCallOrder[0];
+        expect(Math.min(...flagged.map(f => f.order))).toBeLessThan(copyOrder);
+      },
+    );
+
+    it('still imports when the folder flag cannot be set', async () => {
+      warn.mockImplementation(() => {});
+      (RNFS.mkdir as jest.Mock).mockImplementation(async (_path, opts) => {
+        if (opts?.NSURLIsExcludedFromBackupKey) {
+          throw new Error('flag refused');
+        }
+      });
+
+      await importWith(true);
+
+      await waitFor(() =>
+        expect(modelStore.addLocalModel).toHaveBeenCalledWith(target),
+      );
+      expect(warn).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({message: 'flag refused'}),
+      );
+    });
+  });
+
+  describe('picked file name', () => {
+    const localDir = `${RNFS.DocumentDirectoryPath}/models/local`;
+
+    const copyTarget = async (name: string, uri = '/mock/file/path') => {
+      (pick as jest.Mock).mockResolvedValue([{uri, name}]);
+      (RNFS.exists as jest.Mock).mockResolvedValue(false);
+      const {getByTestId} = render(<ModelsScreen />);
+      fireEvent.press(getByTestId('fab-group'));
+      await act(async () => {
+        fireEvent.press(
+          getByTestId('local-fab', {includeHiddenElements: true}),
+        );
+      });
+      await waitFor(() => expect(RNFS.copyFile).toHaveBeenCalled());
+      return (RNFS.copyFile as jest.Mock).mock.calls[0][1] as string;
+    };
+
+    it.each([
+      ['..', undefined],
+      ['../x.gguf', undefined],
+      ['/etc/hosts', undefined],
+      ['file:///data/local/tmp/x', undefined],
+      ['', 'file:///mock/dir/'],
+      ['a\u0000b.gguf', undefined],
+    ])('name %j falls back to file_<uuid>', async (name, uri) => {
+      expect(await copyTarget(name, uri)).toMatch(
+        new RegExp(`^${localDir}/file_[^/]+$`),
+      );
+    });
+
+    it.each(['x.gguf', 'a\\b.gguf'])('keeps the name %j', async name => {
+      expect(await copyTarget(name)).toBe(`${localDir}/${name}`);
+    });
+  });
+
+  it('shows a confirmation alert if file already exists and replaces it', async () => {
+    (RNFS.exists as jest.Mock).mockResolvedValue(true);
+    (pick as jest.Mock).mockResolvedValue([
+      {
+        uri: '/mock/file/path',
+        name: 'mockModelFile.bin',
+      },
+    ]);
+
+    jest.spyOn(Alert, 'alert').mockImplementation((_, __, buttons) => {
+      buttons![0].onPress!();
+    });
+
+    const {getByTestId} = render(<ModelsScreen />);
+
+    // Open the FAB group
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+
+    // Wait for the FAB group to open and its children to be accessible
+    await waitFor(() => {
+      const localFab = getByTestId('local-fab', {includeHiddenElements: true});
+      expect(localFab).toBeTruthy();
+    });
+    const addLocalModelButton = getByTestId('local-fab', {
+      includeHiddenElements: true,
+    });
+
+    await act(async () => {
+      fireEvent.press(addLocalModelButton);
+    });
+
+    await waitFor(() => {
+      expect(Alert.alert).toHaveBeenCalled();
+      expect(RNFS.unlink).toHaveBeenCalledWith(
+        '/path/to/documents/models/local/mockModelFile.bin',
+      );
+      expect(modelStore.removeModelByFullPath).toHaveBeenCalledWith(
+        '/path/to/documents/models/local/mockModelFile.bin',
+      );
+      expect(RNFS.copyFile).toHaveBeenCalled();
+      expect(modelStore.addLocalModel).toHaveBeenCalled();
+    });
+  });
+
+  it('does not replace or copy the file when user cancels the action', async () => {
+    (RNFS.exists as jest.Mock).mockResolvedValue(true);
+    (pick as jest.Mock).mockResolvedValue([
+      {
+        uri: '/mock/file/path',
+        name: 'mockModelFile.bin',
+      },
+    ]);
+
+    jest.spyOn(Alert, 'alert').mockImplementation((_, __, buttons) => {
+      // pressing "Cancel"
+      buttons![2].onPress!();
+    });
+
+    const {getByTestId} = render(<ModelsScreen />);
+    // Open the FAB group
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+
+    // Wait for the FAB group to open and its children to be accessible
+    await waitFor(() => {
+      const localFab = getByTestId('local-fab', {includeHiddenElements: true});
+      expect(localFab).toBeTruthy();
+    });
+    const addLocalModelButton = getByTestId('local-fab', {
+      includeHiddenElements: true,
+    });
+
+    await act(async () => {
+      fireEvent.press(addLocalModelButton);
+    });
+
+    await waitFor(() => {
+      expect(Alert.alert).toHaveBeenCalled();
+      expect(RNFS.unlink).not.toHaveBeenCalled(); // File should not be unlinked (deleted)
+      expect(RNFS.copyFile).not.toHaveBeenCalled(); // File should not be copied
+      expect(modelStore.addLocalModel).not.toHaveBeenCalled(); // Model should not be added
+    });
+  });
+
+  it('keeps both files when user chooses to keep both', async () => {
+    (RNFS.exists as jest.Mock).mockResolvedValueOnce(true); // File already exists
+    (pick as jest.Mock).mockResolvedValue([
+      {
+        uri: '/mock/file/path',
+        name: 'mockModelFile.bin',
+      },
+    ]);
+
+    jest.spyOn(Alert, 'alert').mockImplementation((_, __, buttons) => {
+      // pressing "Keep Both"
+      buttons![1].onPress!();
+    });
+
+    let counter = 1;
+    (RNFS.exists as jest.Mock).mockImplementation(async path => {
+      if (path.includes(`mockModelFile_${counter}.bin`)) {
+        return false; // Ensure new file doesn't exist
+      }
+      return true; // Original file exists
+    });
+
+    const {getByTestId} = render(<ModelsScreen />);
+
+    // Open the FAB group
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+
+    // Wait for the FAB group to open and its children to be accessible
+    await waitFor(() => {
+      const localFab = getByTestId('local-fab', {includeHiddenElements: true});
+      expect(localFab).toBeTruthy();
+    });
+    const addLocalModelButton = getByTestId('local-fab', {
+      includeHiddenElements: true,
+    });
+
+    await act(async () => {
+      fireEvent.press(addLocalModelButton);
+    });
+
+    await waitFor(() => {
+      expect(Alert.alert).toHaveBeenCalled();
+      expect(RNFS.unlink).not.toHaveBeenCalled(); // Original file should not be deleted
+      expect(RNFS.copyFile).toHaveBeenCalledWith(
+        '/mock/file/path',
+        `/path/to/documents/models/local/mockModelFile_${counter}.bin`,
+      );
+      expect(modelStore.addLocalModel).toHaveBeenCalledWith(
+        `/path/to/documents/models/local/mockModelFile_${counter}.bin`,
+      );
+    });
+  });
+
+  it('shows a copying snackbar while file is being copied', async () => {
+    let resolveCopy!: () => void;
+    (RNFS.copyFile as jest.Mock).mockImplementation(
+      () =>
+        new Promise<void>(resolve => {
+          resolveCopy = resolve;
+        }),
+    );
+    (RNFS.exists as jest.Mock).mockImplementation(async (path: string) => {
+      if (path.includes('models/local')) {
+        return false;
+      }
+      return true;
+    });
+    (pick as jest.Mock).mockResolvedValue([
+      {uri: '/mock/file/path', name: 'mockModelFile.bin'},
+    ]);
+
+    const {getByTestId} = render(<ModelsScreen />);
+
+    // Open FAB, press local
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+    await waitFor(() => {
+      expect(
+        getByTestId('local-fab', {includeHiddenElements: true}),
+      ).toBeTruthy();
+    });
+    await act(async () => {
+      fireEvent.press(getByTestId('local-fab', {includeHiddenElements: true}));
+    });
+
+    // Snackbar should be visible while copy is pending
+    await waitFor(() => {
+      expect(getByTestId('copy-model-snackbar')).toBeTruthy();
+    });
+
+    // Resolve the copy
+    await act(async () => {
+      resolveCopy();
+    });
+  });
+
+  it('shows an error alert when copy fails', async () => {
+    const alertSpy = jest.spyOn(Alert, 'alert');
+    (RNFS.copyFile as jest.Mock).mockRejectedValue(new Error('Disk full'));
+    (RNFS.exists as jest.Mock).mockImplementation(async (path: string) => {
+      if (path.includes('models/local')) {
+        return false;
+      }
+      return true;
+    });
+    (pick as jest.Mock).mockResolvedValue([
+      {uri: '/mock/file/path', name: 'mockModelFile.bin'},
+    ]);
+
+    const {getByTestId} = render(<ModelsScreen />);
+
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+    await waitFor(() => {
+      expect(
+        getByTestId('local-fab', {includeHiddenElements: true}),
+      ).toBeTruthy();
+    });
+    await act(async () => {
+      fireEvent.press(getByTestId('local-fab', {includeHiddenElements: true}));
+    });
+
+    await waitFor(() => {
+      expect(alertSpy).toHaveBeenCalledWith(expect.any(String), 'Disk full');
+    });
+  });
+
+  it('prevents double-tap by ignoring second add while copy is in progress', async () => {
+    // First call: copy never resolves so isCopyingModel stays true
+    (RNFS.copyFile as jest.Mock).mockImplementation(
+      () => new Promise<void>(() => {}),
+    );
+    (RNFS.exists as jest.Mock).mockImplementation(async (path: string) => {
+      if (path.includes('models/local')) {
+        return false;
+      }
+      return true;
+    });
+    (pick as jest.Mock).mockResolvedValue([
+      {uri: '/mock/file/path', name: 'mockModelFile.bin'},
+    ]);
+
+    const {getByTestId} = render(<ModelsScreen />);
+
+    // Open FAB and press local to start the first copy
+    const fabGroup = getByTestId('fab-group');
+    fireEvent.press(fabGroup);
+    await waitFor(() => {
+      expect(
+        getByTestId('local-fab', {includeHiddenElements: true}),
+      ).toBeTruthy();
+    });
+    await act(async () => {
+      fireEvent.press(getByTestId('local-fab', {includeHiddenElements: true}));
+    });
+
+    // Verify first copy started
+    await waitFor(() => {
+      expect(pick).toHaveBeenCalledTimes(1);
+    });
+
+    // Reset pick mock to detect if it gets called again
+    (pick as jest.Mock).mockClear();
+
+    // Try to press local FAB again while copy is in progress
+    fireEvent.press(fabGroup);
+    await waitFor(() => {
+      expect(
+        getByTestId('local-fab', {includeHiddenElements: true}),
+      ).toBeTruthy();
+    });
+    await act(async () => {
+      fireEvent.press(getByTestId('local-fab', {includeHiddenElements: true}));
+    });
+
+    // pick should NOT have been called again — the early return guard blocks it
+    expect(pick).not.toHaveBeenCalled();
+  });
+
+  // Add tests for model filtering and grouping
+  describe('Model filtering and grouping', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      // Set up mock models
+      modelStore.models = [downloadedModel, basicModel, hfModel1, hfModel2];
+    });
+
+    it('should filter downloaded models when downloaded filter is active', async () => {
+      uiStore.pageStates.modelsScreen.filters = ['downloaded'];
+
+      const {getByText, queryByText} = render(<ModelsScreen />);
+
+      await waitFor(() => {
+        expect(getByText('downloaded model')).toBeTruthy();
+        expect(queryByText('basic model')).toBeNull();
+      });
+    });
+
+    it('should filter HF models when HF filter is active', async () => {
+      uiStore.pageStates.modelsScreen.filters = ['hf'];
+
+      const {getByText, queryByText, getAllByText} = render(<ModelsScreen />);
+
+      // Open the Available to Download group, since hf mocked models are not downloaded.
+      const button = getByText('Available to Download');
+      fireEvent.press(button);
+
+      await waitFor(() => {
+        // Use getAllByText to get all instances and check the first one exists
+        const modelNames = getAllByText('hf-model-name-1');
+        expect(modelNames.length).toBeGreaterThan(0);
+        expect(queryByText('basic model')).toBeNull();
+      });
+    });
+
+    it('should group models by type when grouped filter is active', async () => {
+      uiStore.pageStates.modelsScreen.filters = ['grouped'];
+
+      const {getByText} = render(<ModelsScreen />);
+
+      await waitFor(() => {
+        expect(getByText('Test Model Type')).toBeTruthy();
+      });
+    });
+
+    it('should group models into ready-to-use and available-to-download when not grouped', async () => {
+      uiStore.pageStates.modelsScreen.filters = [];
+
+      const {getByText} = render(<ModelsScreen />);
+
+      await waitFor(() => {
+        expect(getByText('Ready to Use')).toBeTruthy();
+        expect(getByText('Available to Download')).toBeTruthy();
+      });
+    });
+
+    it('should handle group expansion and collapse', async () => {
+      uiStore.pageStates.modelsScreen.filters = [];
+
+      const {getByText, queryByText} = render(<ModelsScreen />);
+
+      // Not downloaded model should not be visible
+      await waitFor(() => {
+        expect(queryByText('basic model')).toBeNull();
+      });
+
+      const availableGroup = getByText('Available to Download');
+      fireEvent.press(availableGroup);
+
+      // Not downloaded model should be visible after expanding the group
+      await waitFor(() => {
+        expect(getByText('basic model')).toBeTruthy();
+      });
+    });
+  });
+});

@@ -1,0 +1,371 @@
+import React from 'react';
+import {runInAction} from 'mobx';
+
+import {fireEvent, render} from '../../../../jest/test-utils';
+import {derivedTextMessage} from '../../../../jest/fixtures';
+
+import {L10nContext} from '../../../utils';
+import {assistant} from '../../../utils/chat';
+import {l10n} from '../../../locales';
+import {modelStore, ttsStore, voiceModeStore} from '../../../store';
+import type {MessageType} from '../../../utils/types';
+
+import {PlayButton, shouldShowPlayButton} from '../PlayButton';
+
+const makeAssistantMsg = (overrides: Partial<MessageType.DerivedText> = {}) =>
+  ({
+    ...derivedTextMessage,
+    id: 'msg-1',
+    author: {id: assistant.id},
+    text: 'Hello there friend',
+    metadata: {completionResult: {content: 'Hello there friend'}},
+    ...overrides,
+  }) as MessageType.DerivedText;
+
+const renderButton = (message: MessageType.DerivedText) =>
+  render(
+    <L10nContext.Provider value={l10n.en}>
+      <PlayButton message={message} />
+    </L10nContext.Provider>,
+  );
+
+const resetStores = () => {
+  runInAction(() => {
+    ttsStore.deviceMeetsMemory = true;
+    ttsStore.userTTSOverride = null;
+    ttsStore.currentVoice = null;
+    ttsStore.playbackState = {mode: 'idle'};
+    modelStore.isStreaming = false;
+    voiceModeStore.phase = 'closed';
+  });
+};
+
+const makeTurn = (steps: Array<{content: string; partial?: boolean}>) =>
+  ({
+    id: 'turn-1',
+    type: 'assistant_turn',
+    author: {id: assistant.id},
+    createdAt: 0,
+    steps,
+    metadata: {},
+  }) as unknown as MessageType.Any;
+
+describe('shouldShowPlayButton', () => {
+  beforeEach(resetStores);
+
+  it('is true for a finished multi-word assistant reply with TTS available', () => {
+    expect(shouldShowPlayButton(makeAssistantMsg())).toBe(true);
+  });
+
+  it('is false when TTS is unavailable', () => {
+    runInAction(() => {
+      ttsStore.deviceMeetsMemory = false;
+    });
+    expect(shouldShowPlayButton(makeAssistantMsg())).toBe(false);
+  });
+
+  it('is false for a message type that is not text or an assistant turn', () => {
+    const image = {
+      id: 'img-1',
+      type: 'image',
+      author: {id: assistant.id},
+      createdAt: 0,
+      uri: 'file://foo.png',
+      name: 'foo.png',
+      size: 1,
+      width: 1,
+      height: 1,
+    } as MessageType.Any;
+    expect(shouldShowPlayButton(image)).toBe(false);
+  });
+
+  it('is false for user messages', () => {
+    expect(
+      shouldShowPlayButton(makeAssistantMsg({author: {id: 'userId'}})),
+    ).toBe(false);
+  });
+
+  it('is true for single-word messages', () => {
+    expect(shouldShowPlayButton(makeAssistantMsg({text: 'Hi'}))).toBe(true);
+  });
+
+  it('is false for empty / whitespace messages', () => {
+    expect(shouldShowPlayButton(makeAssistantMsg({text: '   '}))).toBe(false);
+  });
+
+  it.each([
+    ['empty text', ''],
+    ['line breaks and tabs', '\n\t'],
+    ['an ideographic space', '\u3000'],
+  ])('is false for %s', (_, text) => {
+    expect(shouldShowPlayButton(makeAssistantMsg({text}))).toBe(false);
+    expect(shouldShowPlayButton(makeTurn([{content: text}]))).toBe(false);
+  });
+
+  it('is false for an assistant turn whose steps carry no visible text', () => {
+    expect(
+      shouldShowPlayButton(makeTurn([{content: ''}, {content: ' \n '}])),
+    ).toBe(false);
+  });
+
+  it('is false for a text reply while streaming without a final completionResult', () => {
+    runInAction(() => {
+      modelStore.isStreaming = true;
+    });
+    expect(shouldShowPlayButton(makeAssistantMsg({metadata: {}}))).toBe(false);
+  });
+
+  it('is false for an assistant turn with a partial step while streaming', () => {
+    runInAction(() => {
+      modelStore.isStreaming = true;
+    });
+    expect(
+      shouldShowPlayButton(
+        makeTurn([{content: 'Still going on', partial: true}]),
+      ),
+    ).toBe(false);
+  });
+
+  it('is true for an older finished reply while another run streams', () => {
+    runInAction(() => {
+      modelStore.isStreaming = true;
+    });
+    expect(shouldShowPlayButton(makeAssistantMsg())).toBe(true);
+    expect(shouldShowPlayButton(makeTurn([{content: 'All done here'}]))).toBe(
+      true,
+    );
+  });
+
+  describe('replies in scripts written without spaces', () => {
+    const chineseReply =
+      '长城是中国古代的军事防御工程，长达万余公里，见证了中国悠久的历史和丰富的文化。';
+    const japaneseReply = '空が青いのは、太陽の光が大気で散乱するからです。';
+
+    it.each([
+      ['Chinese', chineseReply],
+      ['Japanese', japaneseReply],
+    ])('is true for a finished one-paragraph %s text reply', (_, reply) => {
+      expect(
+        shouldShowPlayButton(
+          makeAssistantMsg({
+            text: reply,
+            metadata: {completionResult: {content: reply}},
+          }),
+        ),
+      ).toBe(true);
+    });
+
+    it.each([
+      ['Chinese', chineseReply],
+      ['Japanese', japaneseReply],
+    ])('is true for a finished one-paragraph %s assistant turn', (_, reply) => {
+      expect(shouldShowPlayButton(makeTurn([{content: reply}]))).toBe(true);
+    });
+
+    it('is true for a spaced Korean reply', () => {
+      expect(
+        shouldShowPlayButton(
+          makeTurn([{content: '하늘이 파란 이유는 레일리 산란 때문입니다.'}]),
+        ),
+      ).toBe(true);
+    });
+
+    it('is true for a one-word Korean reply', () => {
+      expect(shouldShowPlayButton(makeTurn([{content: '감사합니다.'}]))).toBe(
+        true,
+      );
+    });
+  });
+
+  describe('replies of any length in any script', () => {
+    it.each([
+      [
+        'a Thai sentence without spaces',
+        'ท้องฟ้าเป็นสีฟ้าเพราะแสงอาทิตย์กระเจิงในชั้นบรรยากาศ',
+      ],
+      ['a Lao reply', 'ຂອບໃຈ'],
+      ['a Khmer reply', 'អរគុណ'],
+      ['a Myanmar reply', 'ကျေးဇူးတင်ပါတယ်'],
+      ['one Han character', '好'],
+      ['one Han character with punctuation', '好。'],
+      ['one kana character', 'ね'],
+      ['one English word', 'Hello'],
+      ['several English words', 'Hello there friend'],
+      ['mixed Latin and Chinese', 'OK，好的。'],
+      ['CJK punctuation only', '。。。'],
+      ['one emoji', '👍'],
+      ['two emoji', '👍🙂'],
+    ])('is true for %s, as text and as an assistant turn', (_, reply) => {
+      expect(
+        shouldShowPlayButton(
+          makeAssistantMsg({
+            text: reply,
+            metadata: {completionResult: {content: reply}},
+          }),
+        ),
+      ).toBe(true);
+      expect(shouldShowPlayButton(makeTurn([{content: reply}]))).toBe(true);
+    });
+  });
+});
+
+describe('PlayButton', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    resetStores();
+  });
+
+  it('opens setup sheet on first tap when no voice chosen', () => {
+    const {getByTestId} = renderButton(makeAssistantMsg());
+    fireEvent.press(getByTestId('playbutton-msg-1'));
+    expect(ttsStore.openSetupSheet).toHaveBeenCalledTimes(1);
+    expect(ttsStore.play).not.toHaveBeenCalled();
+  });
+
+  it('calls play when tapped with a voice chosen', () => {
+    runInAction(() => {
+      ttsStore.currentVoice = {
+        id: 'v1',
+        name: 'Alex',
+        engine: 'system',
+      } as any;
+    });
+    const {getByTestId} = renderButton(makeAssistantMsg());
+    fireEvent.press(getByTestId('playbutton-msg-1'));
+    expect(ttsStore.play).toHaveBeenCalledWith('msg-1', 'Hello there friend', {
+      hadReasoning: false,
+    });
+    expect(ttsStore.stop).not.toHaveBeenCalled();
+  });
+
+  it('passes hadReasoning=true when message metadata has reasoning_content', () => {
+    runInAction(() => {
+      ttsStore.currentVoice = {
+        id: 'v1',
+        name: 'Alex',
+        engine: 'system',
+      } as any;
+    });
+    const {getByTestId} = renderButton(
+      makeAssistantMsg({
+        metadata: {
+          completionResult: {
+            content: 'Hello there friend',
+            reasoning_content: 'deliberating...',
+          },
+        },
+      }),
+    );
+    fireEvent.press(getByTestId('playbutton-msg-1'));
+    expect(ttsStore.play).toHaveBeenCalledWith('msg-1', 'Hello there friend', {
+      hadReasoning: true,
+    });
+  });
+
+  it('passes hadReasoning=false when reasoning_content is whitespace-only', () => {
+    runInAction(() => {
+      ttsStore.currentVoice = {
+        id: 'v1',
+        name: 'Alex',
+        engine: 'system',
+      } as any;
+    });
+    const {getByTestId} = renderButton(
+      makeAssistantMsg({
+        metadata: {
+          completionResult: {
+            content: 'Hello there friend',
+            reasoning_content: '   \n  ',
+          },
+        },
+      }),
+    );
+    fireEvent.press(getByTestId('playbutton-msg-1'));
+    expect(ttsStore.play).toHaveBeenCalledWith('msg-1', 'Hello there friend', {
+      hadReasoning: false,
+    });
+  });
+
+  it('handles assistant_turn messages using derivedText', () => {
+    runInAction(() => {
+      ttsStore.deviceMeetsMemory = true;
+      ttsStore.currentVoice = {
+        id: 'v1',
+        name: 'Alex',
+        engine: 'system',
+      } as any;
+    });
+    const turnMessage = {
+      id: 'turn-9',
+      type: 'assistant_turn' as const,
+      author: {id: assistant.id},
+      createdAt: 0,
+      steps: [
+        {content: 'Sure, here it is.', reasoningContent: 'planning…'},
+        {content: 'Hope this helps.'},
+      ],
+      metadata: {},
+    } as unknown as MessageType.Any;
+    const {getByTestId} = render(
+      <L10nContext.Provider value={l10n.en}>
+        <PlayButton message={turnMessage} />
+      </L10nContext.Provider>,
+    );
+    fireEvent.press(getByTestId('playbutton-turn-9'));
+    expect(ttsStore.play).toHaveBeenCalledWith(
+      'turn-9',
+      'Sure, here it is.\n\nHope this helps.',
+      {hadReasoning: true},
+    );
+  });
+
+  it('calls stop when tapped while this message is playing', () => {
+    runInAction(() => {
+      ttsStore.currentVoice = {
+        id: 'v1',
+        name: 'Alex',
+        engine: 'system',
+      } as any;
+      ttsStore.playbackState = {mode: 'playing', messageId: 'msg-1'};
+    });
+    const {getByTestId} = renderButton(makeAssistantMsg());
+    fireEvent.press(getByTestId('playbutton-msg-1'));
+    expect(ttsStore.stop).toHaveBeenCalledTimes(1);
+    expect(ttsStore.play).not.toHaveBeenCalled();
+  });
+
+  describe('while voice mode is open', () => {
+    beforeEach(() => {
+      runInAction(() => {
+        ttsStore.currentVoice = {
+          id: 'v1',
+          name: 'Alex',
+          engine: 'system',
+        } as any;
+      });
+    });
+
+    it('is disabled and does not replay into the open mic', () => {
+      runInAction(() => {
+        voiceModeStore.phase = 'listening';
+      });
+      const {getByTestId} = renderButton(makeAssistantMsg());
+      const button = getByTestId('playbutton-msg-1');
+      expect(button.props.accessibilityState).toEqual(
+        expect.objectContaining({disabled: true}),
+      );
+      fireEvent.press(button);
+      expect(ttsStore.play).not.toHaveBeenCalled();
+    });
+
+    it('replays again once voice mode is closed', () => {
+      const {getByTestId} = renderButton(makeAssistantMsg());
+      const button = getByTestId('playbutton-msg-1');
+      expect(button.props.accessibilityState).toEqual(
+        expect.objectContaining({disabled: false}),
+      );
+      fireEvent.press(button);
+      expect(ttsStore.play).toHaveBeenCalledTimes(1);
+    });
+  });
+});
